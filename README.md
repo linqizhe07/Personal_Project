@@ -143,13 +143,6 @@ Pretrain script arguments:
 * The prompts are listed in `prompts/` folder.
 * Elo scoring in `human_feedback/` folder.
 
-*Note, we will soon release the AirSim environment setup script.*
-
-For AirSim, follow the instruction on this link [https://microsoft.github.io/AirSim/build_linux/](AirSim)
-```shell
-export AIRSIM_PATH='AirSim'
-export AIRSIMNH_PATH='AirSimNH/AirSimNH/LinuxNoEditor/AirSimNH.sh'
-```
 
 ## Citation
 
