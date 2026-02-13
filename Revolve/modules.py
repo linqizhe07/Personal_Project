@@ -1,0 +1,356 @@
+"""
+Various stages of individual generation, training, and evaluation:
+1. Reward Function Generation
+2. Policy Training
+3. Policy Evaluation
+"""
+
+import concurrent.futures
+import json
+import multiprocessing
+import os
+import time
+from typing import Tuple, Optional, Dict
+
+import absl.logging as logging
+import hydra
+import openai
+from hydra.core.global_hydra import GlobalHydra
+from openai import OpenAI
+
+from rl_agent.evaluate import return_score
+# from rl_agent.generate_scores import generate_behaviour
+from rl_agent.main import run_training
+from utils import parse_llm_output, serialize_dict, format_human_feedback
+
+openai_api_key = os.environ["OPENAI_API_KEY"]
+client = OpenAI(api_key=openai_api_key)
+
+
+# generates reward functions
+class RewardFunctionGeneration:
+    def __init__(self, system_prompt: str, env_input: str):
+        # TODO: change system message based on Eureka
+        self.system_prompt = system_prompt
+        self.env_input = env_input  # env_class + task
+        self.llm = "gpt-4-1106-preview"
+
+    def query_llm(self, in_context_prompt: str) -> Tuple[str, int, int]:
+        response = client.chat.completions.create(
+            model=self.llm,  # gpt-4-1106-preview, gpt-3.5-turbo-1106
+            messages=[
+                {
+                    "role": "system",
+                    "content": self.system_prompt + "\n" + self.env_input,
+                },
+                {"role": "user", "content": f"{in_context_prompt}"},
+            ],
+            temperature=1,
+            max_tokens=4096,
+            top_p=1,
+            frequency_penalty=0,
+            presence_penalty=0,
+        )
+
+        return (
+            response.choices[0].message.content,
+            response.usage.prompt_tokens,
+            response.usage.completion_tokens,
+        )
+
+    @staticmethod
+    def prepare_in_context_prompt(
+            in_context_samples: Optional[List[Tuple[str, float]]],
+            operator_prompt: str,
+            evolve: bool,
+            baseline: str,
+    ) -> str:
+        # prepares a prompt from in context examples sampled from RewardsDatabase
+        in_context_samples_str = ""
+        if not evolve:
+            return in_context_samples_str
+        for filename, fitness_score in in_context_samples:
+            in_context_samples_str += "\n\n```python\n"
+            in_context_samples_str += open(filename, "r").read()
+            in_context_samples_str += "\n```\n"
+            reward_history_file = filename.replace(
+                "generated_fns", "reward_history"
+            ).replace(".txt", ".json")
+            # reward_history = json.load(open(reward_history_file, "r"))
+
+            reward_history = []
+            with open(reward_history_file, "r") as f:
+                for line in f:
+                    reward_history.append(json.loads(line.strip()))
+
+            combined_components = {}
+            for entry in reward_history:
+                for key, value in entry["episode_components"].items():
+                    if key not in combined_components:
+                        combined_components[key] = []
+                    combined_components[key].append(value)
+            in_context_samples_str += f"fitness score: {fitness_score}"
+            in_context_samples_str += f"\n{serialize_dict(combined_components)}"
+            if "auto" not in baseline:
+                # human feedback
+                human_feedback_file = filename.replace(
+                    "generated_fns", "human_feedback"
+                )
+                human_feedback = open(human_feedback_file, "r").read()
+                human_feedback = format_human_feedback(human_feedback)
+                in_context_samples_str += f"\nhuman feedback: {human_feedback}"
+        operator_prompt = operator_prompt.replace(
+            "\n\n<EXAMPLES>", in_context_samples_str
+        )
+        operator_prompt = operator_prompt.replace("<EPISODES>", "100")
+        return operator_prompt
+
+    def generate_rf(self, in_context_prompt: str) -> str:
+        parsed_function_str = None
+        while True:
+            try:
+                raw_llm_output, _, _ = self.query_llm(in_context_prompt)
+                parsed_function_str = parse_llm_output(raw_llm_output)
+                break
+            # except openai.RateLimitError or openai.APIError or openai.Timeout:
+            except openai.RateLimitError or openai.APIError or openai.Timeout:
+                time.sleep(10)
+                continue
+        # parsed_function_str = open("test_heuristic", "r").read()
+        return parsed_function_str
+
+
+class TrainPolicy:
+    """
+    Train RL Policy
+    """
+
+    def __init__(
+            self,
+            reward_fn_str: str,
+            generation_id: int,
+            counter_id: int,
+            island_id: int,
+            baseline: str,
+            output_log: str,
+    ):
+        self.train_cfg = None
+        self._load_train_cfg()
+
+        self.reward_func_str = reward_fn_str
+        self.island_id = island_id
+        self.generation_id = generation_id
+        self.counter_id = counter_id
+        self.baseline = baseline  # ['revolve', 'revolve_auto', 'eureka', 'eureka_auto']
+        self.output_log = output_log
+        # U2O parameters (optional, set via enable_u2o())
+        self.u2o_enabled = False
+        self.pretrained_dir = None
+        self.feature_dim = 32
+        logging.info(
+            f"Initializing TrainPolicy: generation_id={generation_id}, island_id={island_id}, type(island_id)={type(island_id)}"
+        )
+
+    def enable_u2o(self, pretrained_dir: str, feature_dim: int = 32):
+        """Enable U2O mode: bridge + fine-tune instead of from-scratch training."""
+        self.u2o_enabled = True
+        self.pretrained_dir = pretrained_dir
+        self.feature_dim = feature_dim
+
+    def _load_train_cfg(self):
+        logging.info("Loading train cfg")
+
+        # Ensure ROOT_PATH exists
+        root_path = os.environ.get("ROOT_PATH")
+        if not root_path:
+            raise EnvironmentError("ROOT_PATH environment variable is not set.")
+
+        # Convert absolute path to relative
+        config_relative_path = os.path.relpath(
+            os.path.join(root_path, "cfg"), start=os.getcwd()
+        )
+
+        # Clear Hydra global state if already initialized
+        if GlobalHydra.instance().is_initialized():
+            GlobalHydra.instance().clear()
+
+        # Initialize Hydra with the relative config path
+        with hydra.initialize(config_path=config_relative_path):
+            self.train_cfg = hydra.compose(config_name="train")
+            logging.info("Training Config loaded")
+
+    def train_policy(self) -> Tuple[str, str]:
+        # This will define the compute_reward function dynamically
+
+        reward_history_file = os.path.join(
+            self.output_log,
+            f"island_{self.island_id}/reward_history/{self.generation_id}_{self.counter_id}.json",
+        )
+
+        checkpoint_file = os.path.join(
+            self.output_log,
+            f"island_{self.island_id}/model_checkpoints/{self.generation_id}_{self.counter_id}.h5",
+        )
+
+        velocity_file_path = os.path.join(
+            self.output_log,
+            f"island_{self.island_id}/velocity_logs/velocity_{self.generation_id}_{self.counter_id}.txt",
+        )
+
+        model_checkpoint_path = os.path.join(
+            self.output_log, f"island_{self.island_id}/model_checkpoints"
+        )
+
+        fitness_file = os.path.join(
+            self.output_log,
+            f"island_{self.island_id}/fitness_scores/{self.generation_id}_{self.counter_id}.txt",
+        )
+
+        log_dir = os.path.join(
+            self.output_log,
+            f"island_{self.island_id}/log_dir/{self.generation_id}_{self.counter_id}",
+        )
+
+        if self.u2o_enabled:
+            # U2O path: bridge step -> fine-tune pretrained policy
+            import torch
+            import numpy as np
+            from u2o.bridge import bridge_step, build_env_state_from_obs
+            from u2o.networks import HILPFeatureNetwork
+            from rl_agent.main import run_training_u2o
+            from utils import define_function_from_string
+
+            # Load pretrained config
+            config_path = os.path.join(self.pretrained_dir, "pretrain_config.json")
+            with open(config_path, "r") as f:
+                pretrain_config = json.load(f)
+
+            # Load feature network
+            feature_net = HILPFeatureNetwork(
+                obs_dim=pretrain_config["obs_dim"],
+                feature_dim=pretrain_config["feature_dim"],
+                hidden_dims=tuple(pretrain_config["feature_hidden_dims"]),
+            )
+            feature_net.load_state_dict(
+                torch.load(
+                    os.path.join(self.pretrained_dir, "hilp_feature_net.pt"),
+                    map_location="cpu",
+                )
+            )
+            feature_net.eval()
+
+            # Load exploration buffer
+            buffer = dict(
+                np.load(
+                    os.path.join(self.pretrained_dir, "exploration_buffer.npz")
+                )
+            )
+
+            # Parse the reward function for bridge step
+            reward_func, _ = define_function_from_string(self.reward_func_str)
+
+            # Bridge step: compute z*
+            z_star, alpha = bridge_step(
+                reward_func=reward_func,
+                feature_net=feature_net,
+                buffer=buffer,
+                env_state_builder=build_env_state_from_obs,
+            )
+            logging.info(
+                f"U2O bridge: z* norm={np.linalg.norm(z_star):.4f}, alpha={alpha:.4f}"
+            )
+
+            # Fine-tune with z*
+            pretrained_model_path = os.path.join(
+                self.pretrained_dir, "hilp_policy"
+            )
+            run_training_u2o(
+                self.reward_func_str,
+                self.island_id,
+                self.generation_id,
+                self.counter_id,
+                reward_history_file,
+                model_checkpoint_path,
+                fitness_file,
+                velocity_file_path,
+                self.output_log,
+                log_dir,
+                pretrained_model_path=pretrained_model_path,
+                z_star=z_star,
+                feature_dim=self.feature_dim,
+            )
+        else:
+            # Original path: from-scratch training
+            run_training(
+                self.reward_func_str,
+                self.island_id,
+                self.generation_id,
+                self.counter_id,
+                reward_history_file,
+                model_checkpoint_path,
+                fitness_file,
+                velocity_file_path,
+                self.output_log,
+                log_dir,
+            )
+        return checkpoint_file, velocity_file_path
+
+
+# human evaluation, fitness functions
+class RewardFunctionEvaluation:
+    """
+    Fitness Function Evaluator
+    """
+
+    def __init__(self, baseline: str):
+        self.baseline = baseline
+
+    # def generate_behavior(self, filename: str) -> Dict:
+    #     # be provided
+    #     reward_history_dict = json.load(open(filename, "r"))
+    #     return reward_history_dict
+
+    @staticmethod
+    def evaluate_behavior(
+            full_velocity_log_path,
+    ) -> Dict[str, float]:
+        fitness_score = return_score(full_velocity_log_path)
+        return {"fitness": fitness_score}
+
+
+def train_policies_in_parallel(
+        policy_classes: List[TrainPolicy],
+) -> List[Tuple[str, str]]:
+    """
+    submit multiple training policies in parallel
+    """
+    multiprocessing.set_start_method("spawn", force=True)
+    with concurrent.futures.ProcessPoolExecutor(
+            max_workers=len(policy_classes)
+    ) as executor:
+        futures = [
+            executor.submit(policy_class.train_policy)
+            for policy_class in policy_classes
+        ]
+        #  results = executor.map(train_model, enumerate(model_classes))
+
+        results = [future.result() for future in futures]
+    return results
+
+
+def evaluate_policies_in_parallel(
+        ckpt_and_performance_paths: List[Tuple[str, str]]
+) -> List[Dict[str, float]]:
+    """
+    Submit evaluation tasks in parallel with both checkpoint paths and velocity paths.
+    """
+    with concurrent.futures.ProcessPoolExecutor(
+            max_workers=len(ckpt_and_performance_paths)
+    ) as executor:
+        futures = [
+            executor.submit(RewardFunctionEvaluation.evaluate_behavior, velocity_path)
+            for _, velocity_path in ckpt_and_performance_paths
+        ]
+
+        fitness_dicts = [future.result() for future in futures]
+    return fitness_dicts
